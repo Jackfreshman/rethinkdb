@@ -1,0 +1,70 @@
+<div class="intro">
+  <p>
+    Experiment with sharding and replication changes for this table.
+  </p>
+  <p>
+    When you're satisfied, click "Apply configuration" to enact the changes.
+  </p>
+  <p>
+    <strong>Note:</strong> Changes to shards will cause the table to
+    become unavailable temporarily.
+  </p>
+  <form class="reconfigure-form">
+    <div>
+      <input class="shards inline-edit"
+             value="{{num_shards}}"></input>
+      <span class="caption">shards</span>
+      <div class="max caption">
+        max: {{num_default_servers}}
+      </div>
+    </div>
+    <div>
+      <input class="replicas inline-edit"
+             value="{{num_replicas_per_shard}}"></input>
+      <span class="caption">replicas per shard</span>
+      <div class="max caption">
+        max: {{num_default_servers}}
+      </div>
+    </div>
+  </form>
+</div>
+<div class="alert alert-error error">
+  <p class="error zero-shards">
+    Each table must have at least one shard.
+  </p>
+  <p class="error no-shards">
+    The number of shards is not set.
+  </p>
+  <p class="error zero-replicas">
+    Each table must have at least one replica per shard.
+  </p>
+  <p class="error no-replicas">
+    The number of replicas per shard is not set.
+  </p>
+  <p class="error too-many-shards">
+    A table may have at most {{num_default_servers}} shards.
+  </p>
+  <p class="error not-enough-defaults-shard">
+    While you have enough servers for this many shards, not enough of
+    them have the "default" tag.  You can manage server tags through
+    the table "rethinkdb.server_config".
+  </p>
+  <p class="error not-enough-defaults-replica">
+    While you have enough servers for this many replicas, not enough
+    of them have the "default" tag. You can manage server tags through
+    the table "rethinkdb.server_config".
+  </p>
+  <p class="error too-many-replicas">
+    A table cannot have more than {{num_default_servers}} replicas per
+    shard.
+  </p>
+  <p class="error server-error">
+    The server returned the following error:
+    <div class="server-msg">
+    {{server_error}}
+    </div>
+  </p>
+</div>
+<a href="#" class="expand-tree">Where's my data going?</a>
+<a href="#" class="collapse-tree">Hide server assignments</a>
+<div class='reconfigure-diff tree-view'></div>

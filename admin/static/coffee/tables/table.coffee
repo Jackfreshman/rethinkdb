@@ -24,22 +24,24 @@ module 'TableView', ->
             query =
                 r.do(
                     r.db(system_db).table('server_config').coerceTo('array'),
-                    r.db(system_db).table('server_config').count(),
                     r.db(system_db).table('table_status').get(this_id),
                     r.db(system_db).table('table_config').get(this_id),
-                    (server_config, num_servers, table, table_config) ->
+                    (server_config, table, table_config) ->
                         r.branch(
                             table.eq(null),
                             null,
                             table.merge(
+                                max_shards: 32
                                 num_shards: table("shards").count()
+                                num_servers: server_config.count()
+                                num_default_servers: server_config.filter((server) ->
+                                    server('tags').contains('default')).count()
                                 num_available_shards: table("shards").filter((shard) ->
                                     shard('replicas')(shard('replicas')('server').indexesOf(shard('primary_replica'))(0))('state').eq('ready')
                                     ).count()
                                 num_replicas: table("shards").concatMap( (shard) -> shard('replicas')).count()
                                 num_available_replicas: table("shards").concatMap((shard) ->
                                     shard('replicas').filter({state: "ready"})).count()
-                                max_replicas_per_shard: num_servers
                                 num_replicas_per_shard: table("shards").map((shard) -> shard('replicas').count()).max()
                                 status: table('status')
                                 shards_assignments: table_config("shards").map(r.range(), (shard, position) ->
@@ -61,10 +63,12 @@ module 'TableView', ->
                                 total_keys: null
                             ).do( (table) ->
                                 r.branch( # We must be sure that the table is ready before retrieving these keys
-                                    table('status')('ready_for_outdated_reads').not(),
+                                    table('status')('ready_for_writes').not(),
                                     table,
                                     table.merge({
-                                        indexes: r.db(table("db")).table(table("name")).indexStatus()
+                                        indexes: r.db(table("db"))
+                                            .table(table("name"), {useOutdated: true})
+                                            .indexStatus()
                                             .pluck('index', 'ready', 'blocks_processed', 'blocks_total')
                                             .merge( (index) -> {
                                                 id: index("index")
@@ -72,20 +76,20 @@ module 'TableView', ->
                                                 table: table("name")
                                             }) # add an id for backbone
                                         distribution: r.db(table('db'))
-                                            .table(table('name'), useOutdated: true)
+                                            .table(table('name'), {useOutdated: true})
                                             .info()('doc_count_estimates')
                                             .map(r.range(), (num_keys, position) ->
                                                 num_keys: num_keys
                                                 id: position)
                                             .coerceTo('array')
                                         total_keys: r.db(table('db'))
-                                            .table(table('name'), useOutdated: true)
+                                            .table(table('name'), {useOutdated: true})
                                             .info()('doc_count_estimates')
                                             .sum()
                                         shards_assignments: table('shards_assignments').map(r.range(), (shard_assignment, position) ->
                                             shard_assignment.merge {
                                                 num_keys: r.db(table('db'))
-                                                    .table(table('name'), useOutdated: true)
+                                                    .table(table('name'), {useOutdated: true})
                                                     .info()('doc_count_estimates')(position)
                                             }
                                         ).coerceTo('array')
@@ -229,8 +233,6 @@ module 'TableView', ->
             @distribution = data.distribution
             @shards_assignments = data.shards_assignments
 
-            #TODO Load distribution
-
             # Panels for namespace view
             @title = new TableView.Title
                 model: @model
@@ -240,14 +242,14 @@ module 'TableView', ->
             @secondary_indexes_view = new TableView.SecondaryIndexesView
                 collection: @indexes
                 model: @model
-            @replicas = new TableView.Replicas
-                model: @model
             @shards = new TableView.Sharding
                 collection: @distribution
                 model: @model
             @server_assignments = new TableView.ShardAssignmentsView
                 model: @model
                 collection: @shards_assignments
+            @reconfigure = new TableView.ReconfigurePanel
+                model: @model
 
             @stats = new Stats
             @stats_timer = driver.run(
@@ -290,9 +292,6 @@ module 'TableView', ->
 
             @$('.performance-graph').html @performance_graph.render().$el
 
-            # Display the replicas
-            @$('.replication').html @replicas.render().el
-
             # Display the shards
             @$('.sharding').html @shards.render().el
 
@@ -301,6 +300,9 @@ module 'TableView', ->
 
             # Display the secondary indexes
             @$('.secondary_indexes').html @secondary_indexes_view.render().el
+
+            # Display server reconfiguration
+            @$('.reconfigure-panel').html @reconfigure.render().el
 
             @
 
@@ -342,11 +344,11 @@ module 'TableView', ->
         remove: =>
             @title.remove()
             @profile.remove()
-            @replicas.remove()
             @shards.remove()
             @server_assignments.remove()
             @performance_graph.remove()
             @secondary_indexes_view.remove()
+            @reconfigure.remove()
 
             driver.stop_timer @stats_timer
 
@@ -356,6 +358,123 @@ module 'TableView', ->
             if @rename_modal?
                 @rename_modal.remove()
             super()
+
+    # TableView.ReconfigurePanel
+    class @ReconfigurePanel extends Backbone.View
+        className: 'reconfigure-panel'
+        templates:
+            main: Handlebars.templates['reconfigure']
+            status: Handlebars.templates['replica_status-template']
+        events:
+            'click .reconfigure.btn': 'launch_modal'
+
+        initialize: (obj) =>
+            @model = obj.model
+            @listenTo @model, 'change:num_shards', @render
+            @listenTo @model, 'change:num_replicas_per_shard', @render
+            @listenTo @model, 'change:num_available_replicas', @render_status
+            @progress_bar = new UIComponents.OperationProgressBar @templates.status
+            @timer = null
+
+        launch_modal: =>
+            if @reconfigure_modal?
+                @reconfigure_modal.remove()
+            @reconfigure_modal = new Modals.ReconfigureModal
+                model: new Reconfigure
+                    parent: @
+                    id: @model.get('id')
+                    db: @model.get('db')
+                    name: @model.get('name')
+                    total_keys: @model.get('total_keys')
+                    shards: []
+                    max_shards: @model.get('max_shards')
+                    num_shards: @model.get('num_shards')
+                    num_servers: @model.get('num_servers')
+                    num_default_servers: @model.get('num_default_servers')
+                    num_replicas_per_shard: @model.get('num_replicas_per_shard')
+            @reconfigure_modal.render()
+
+        remove: =>
+            if @reconfigure_modal?
+                @reconfigure_modal.remove()
+            if timer?
+                driver.stop_timer @timer
+                @timer = null
+            @progress_bar.remove()
+            super()
+
+        fetch_progress: =>
+            query = r.db(system_db).table('table_status')
+                .get(@model.get('id'))('shards')('replicas').concatMap((x) -> x)
+                .do((replicas) ->
+                    num_available_replicas: replicas.filter(state: 'ready').count()
+                    num_replicas: replicas.count()
+                )
+            if @timer?
+                driver.stop_timer @timer
+                @timer = null
+            @timer = driver.run query, 1000, (error, result) =>
+                if error?
+                    # This can happen if the table is temporarily
+                    # unavailable. We log the error, and ignore it
+                    console.log "Nothing bad - Could not fetch replicas statuses"
+                    console.log error
+                else
+                    @model.set result
+                    @render_status()  # Force to refresh the progress bar
+
+        # Render the status of the replicas and the progress bar if needed
+        render_status: =>
+            #TODO Handle backfilling when available in the api directly
+            if @model.get('num_available_replicas') < @model.get('num_replicas')
+                if not @timer?
+                    @fetch_progress()
+                    return
+
+                if @progress_bar.get_stage() is 'none'
+                    @progress_bar.skip_to_processing()
+
+            else if @model.get('num_available_replicas') is @model.get('num_replicas')
+                if @timer?
+                    driver.stop_timer @timer
+                    @timer = null
+
+            @progress_bar.render(
+                @model.get('num_available_replicas'),
+                @model.get('num_replicas'),
+                {got_response: true}
+            )
+
+        render: =>
+            @$el.html @templates.main @model.toJSON()
+            if @model.get('num_available_replicas') < @model.get('num_replicas')
+                if @progress_bar.get_stage() is 'none'
+                    @progress_bar.skip_to_processing()
+            @$('.backfill-progress').html @progress_bar.render(
+                @model.get('num_available_replicas'),
+                @model.get('num_replicas'),
+                {got_response: true},
+            ).$el
+            @
+
+    # TableView.ReconfigureDiffView
+    class @ReconfigureDiffView extends Backbone.View
+        # This is just for the diff view in the reconfigure
+        # modal. It's so that the diff can be rerendered independently
+        # of the modal itself (which includes the input form). If you
+        # rerended the entire modal, you lose focus in the text boxes
+        # since handlebars creates an entirely new dom tree.
+        #
+        # You can find the ReconfigureModal in coffee/modals.coffee
+
+        className: 'reconfigure-diff'
+        template: Handlebars.templates['reconfigure-diff']
+        initialize: =>
+            @listenTo @model, 'change:shards', @render
+
+        render: =>
+            @$el.html @template @model.toJSON()
+            @
 
     # TableView.Title
     class @Title extends Backbone.View
@@ -553,7 +672,7 @@ module 'TableView', ->
             @$('.add_index_li').slideDown 'fast'
             @$('.create_container').slideUp 'fast'
             @$('.new_index_name').focus()
-        
+
         # Hide the form to add a secondary index
         hide_add_index: =>
             @$('.add_index_li').slideUp 'fast'
@@ -568,7 +687,7 @@ module 'TableView', ->
             else if event.which is 27 # ESC
                 event.preventDefault()
                 @hide_add_index()
-       
+
         on_fail_to_connect: =>
             @loading = false
             @render_error
@@ -609,7 +728,7 @@ module 'TableView', ->
                 @deleting_secondary_index = null
             event.preventDefault()
             $(event.target).parent().slideUp 'fast'
-        
+
         remove: =>
             @stopListening()
             for view in @indexes_view
